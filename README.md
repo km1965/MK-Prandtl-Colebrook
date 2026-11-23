@@ -17,6 +17,7 @@ et **Word**, et **catalogue MCP des ventouses intégré au code**.
 - [Utilisation](#utilisation)
 - [Formats des fichiers d'entrée](#formats-des-fichiers-dentrée)
 - [Paramètres de calcul](#paramètres-de-calcul)
+- [Matériaux de canalisation et rugosité](#matériaux-de-canalisation-et-rugosité)
 - [Méthodologie](#méthodologie)
 - [Catalogue MCP des ventouses](#catalogue-mcp-des-ventouses)
 - [Sorties générées](#sorties-générées)
@@ -52,6 +53,9 @@ et **Word**, et **catalogue MCP des ventouses intégré au code**.
 - **Deux sources de dimensionnement** : capacités historiques (`STD`, défaut,
   résultats identiques aux versions précédentes) ou débits critiques du catalogue
   MCP (`mcp`, admission à -0,5 bar et évacuation à +0,9 bar).
+- **Matériaux de canalisation** : PVC, Acier revêtu, Acier, Fonte, PRV et PEHD,
+  avec rugosité Colebrook conforme ; surcharge possible par point depuis les
+  colonnes `Materiaux` / `Rugosite` du fichier d'import.
 
 ---
 
@@ -156,6 +160,12 @@ python main1.py --mode simple --input-xlsx cas_simples.xlsx --out-dir sorties_si
 
 # Avec le dimensionnement selon le catalogue MCP
 python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_MCP --source-ventouses mcp
+
+# Avec un matériau de canalisation (rugosité Colebrook associée)
+python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_Fonte --materiau Fonte
+
+# Avec une rugosité particulière (k en mm, écrase le matériau)
+python main1.py --mode simple --input-xlsx cas_simples.xlsx --out-dir sorties_k --rugosite-mm 0,3
 ```
 
 | Option | Description |
@@ -165,6 +175,8 @@ python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_MCP --sourc
 | `--input-xlsx` | Chemin du classeur d'entrée (obligatoire en CLI) |
 | `--out-dir` | Dossier de sortie (défaut : `sorties_cli`) |
 | `--source-ventouses {std,mcp}` | Capacités de dimensionnement : `std` historique (défaut) ou `mcp` (débits critiques du catalogue) |
+| `--materiau {...}` | Matériau de canalisation : `Historique` (défaut), `PVC`, `Acier revêtu`, `Acier`, `Fonte`, `PRV`, `PEHD` |
+| `--rugosite-mm` | Rugosité absolue `k` en mm (écrase le matériau et le défaut 0,1 mm) |
 
 ---
 
@@ -173,6 +185,8 @@ python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_MCP --sourc
 ### Mode `pl` — onglet `Profil_en_Long`
 
 Colonnes attendues : `piquet`, `x_m`, `z_m`, `dn_mm`, `pn_bar`.
+Colonnes **optionnelles** : `Materiaux`, `Rugosite` (voir la section
+« Matériaux de canalisation et rugosité »).
 
 La colonne `piquet` est un **libellé libre** : elle peut contenir des PK
 (`PK 0+000`, comme dans l'exemple fourni) ou directement des **numéros de piquet**
@@ -199,7 +213,8 @@ du logiciel).
 | `Points_Bas` | `piquet_pb`, `x_av`, `x_am`, `h_moy`, `d_equiv_mm`, `x_pb`, `z_pb`, `dn_vid_mm`, `pn_bar` |
 
 Les colonnes `ig1_force_pct` / `ig2_force_pct` permettent de forcer un gradient
-(en %) plutôt que de le déduire de la géométrie.
+(en %) plutôt que de le déduire de la géométrie. Les colonnes optionnelles
+`Materiaux` et `Rugosite` sont acceptées dans les trois feuilles.
 
 ---
 
@@ -212,8 +227,8 @@ contenu du classeur, pas une limite d'import.
 
 | Fichier | Mode | Contenu |
 |---|---|---|
-| `Exemple_Import_Profil_En_Long.xlsx` | `pl` | 17 piquets sur 4,6 km (PK 0+000 → PK 4+600), 4 points hauts, 3 points bas, 3 points intermédiaires équipés. Feuille `Profil_en_Long`. Les PK de la colonne `piquet` sont de simples libellés, remplaçables par des numéros. |
-| `Exemple_Import_Cas_Simples.xlsx` | `simple` | 3 points hauts (dont un avec gradient forcé à 0,5 %), 3 points intermédiaires (1 cas NON, 2 cas OUI), 3 points bas. Feuilles `Points_Hauts`, `Points_Intermediaires`, `Points_Bas`. |
+| `Exemple_Import_Profil_En_Long.xlsx` | `pl` | 17 piquets sur 4,6 km (PK 0+000 → PK 4+600), 4 points hauts, 3 points bas, 3 points intermédiaires équipés. Feuille `Profil_en_Long`. Les PK de la colonne `piquet` sont de simples libellés, remplaçables par des numéros. Colonnes `Materiaux` / `Rugosite` présentes et vides. |
+| `Exemple_Import_Cas_Simples.xlsx` | `simple` | 3 points hauts (dont un avec gradient forcé à 0,5 %), 3 points intermédiaires (1 cas NON, 2 cas OUI), 3 points bas. Feuilles `Points_Hauts`, `Points_Intermediaires`, `Points_Bas` avec colonnes `Materiaux` / `Rugosite` vides. |
 
 Utilisation immédiate en ligne de commande :
 
@@ -235,11 +250,43 @@ ou l'autre et active automatiquement le mode de calcul correspondant.
 | `g` | Pesanteur (m/s²) | 9.81 |
 | `nu` | Viscosité cinématique de l'eau (m²/s) | 1.1e-6 |
 | `k_roughness` | Rugosité Colebrook (m) | 0.0001 (0,1 mm) |
+| `materiau_canalisation` | Matériau retenu pour la rugosité | `Historique` (0,1 mm) |
 | `dep_max` | Dépression maximale tolérée (mCE) | 3.0 |
 | `v_remplissage` | Vitesse de remplissage progressive (m/s) | 0.5 |
 | `mu_vidange` | Coefficient de débit de vidange | 0.7 |
 | `h_seuil_interm` | Seuil de dépression déclenchant une protection intermédiaire (m) | 3.0 |
 | `k_sing` | Coefficient de perte singulière de sortie | 1.0 |
+
+### Matériaux de canalisation et rugosité
+
+Le sélecteur **« Matériau canalisation »** du panneau latéral (ou l'option CLI
+`--materiau`) fixe automatiquement la rugosité absolue `k` utilisée dans Colebrook.
+Le champ `k` reste modifiable pour une valeur particulière ; dans ce cas le
+matériau est signalé comme `Personnalisé` dans le rapport.
+
+| Matériau | Rugosité absolue `k` (mm) |
+|---|---|
+| PVC | 0,0015 |
+| Acier revêtu | 0,050 |
+| Acier | 0,050 |
+| Fonte | 0,250 |
+| PRV (polyester renforcé verre) | 0,010 |
+| PEHD | 0,0015 |
+| Historique (défaut) | 0,100 |
+
+**Surcharge par point depuis l'import** : les classeurs peuvent contenir deux
+colonnes optionnelles (ajoutées aux exemples, laissées vides pour garder le
+comportement historique) :
+
+- `Materiaux` : nom du matériau (avec ou sans accent, majuscules/minuscules
+  acceptées : `PVC`, `Acier revêtu`/`Acier revetu`, `Acier`, `Fonte`, `PRV`, `PEHD`).
+- `Rugosite` : rugosité `k` **en mm** (le séparateur décimal `,` est accepté).
+  Un matériau inconnu provoque une erreur explicite plutôt qu'un calcul silencieux.
+
+Ordre de priorité : **`Rugosite` (fichier) > `Materiaux` (fichier) > réglage global
+(interface/CLI) > 0,1 mm historique**. Le détail retenu figure dans les colonnes
+`materiau_canalisation`, `rugosite_mm` et `rugosite_origine` des tableaux de
+résultats, ainsi que dans la note Word.
 
 ---
 
@@ -427,6 +474,9 @@ Copyright © 2026 Mostafa Karim Soussi (km1965).
 - [x] **Utilisation des capacités catalogue MCP pour le dimensionnement** : option
       « Dimensionner avec le catalogue MCP » dans l'interface et `--source-ventouses mcp`
       en CLI, avec feuille de synthèse `Dimensionnement_MCP` dans le rapport Excel.
+- [x] **Choix du matériau de canalisation** (PVC, Acier revêtu, Acier, Fonte, PRV,
+      PEHD) avec rugosité Colebrook conforme, sélection GUI/CLI et surcharge par
+      point via les colonnes d'import `Materiaux` / `Rugosite`.
 
 ---
 

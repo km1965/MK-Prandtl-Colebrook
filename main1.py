@@ -20,6 +20,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 
 if getattr(sys, "frozen", False):
@@ -72,6 +73,20 @@ DEFAULT_PARAMS = {
     "h_seuil_interm": 3.0,   # Seuil H (m) déclenchant la protection point intermédiaire
     "k_sing": 1.0,           # Coefficient de perte singulière de sortie dh = k * V^2 / (2g)
 }
+
+# Rugosité absolue k (mm) par matériau de canalisation (valeurs de référence).
+RUGOSITES_MATERIAUX_MM = {
+    "PVC": 0.0015,
+    "Acier revêtu": 0.050,
+    "Acier": 0.050,
+    "Fonte": 0.250,
+    "PRV": 0.010,
+    "PEHD": 0.0015,
+}
+MATERIAU_HISTORIQUE = "Historique"
+RUGOSITE_HISTORIQUE_MM = 0.100
+CHOIX_MATERIAUX = [MATERIAU_HISTORIQUE] + list(RUGOSITES_MATERIAUX_MM)
+MATERIAU_PERSONNALISE = "Personnalisé"
 
 VENTOUSES_STD = [
     (50,  "DN50",  900.0),
@@ -257,6 +272,102 @@ def lambda_colebrook(k_val: float, d_val: float, v_val: float, nu_val: float) ->
         arg = k_val / (3.71 * d_val) + (2.51 * nu_val) / (d_val * v_eff * sqrt_l)
         inv_sqrt_l = -2.0 * math.log10(max(arg, 1e-15))
     return 1.0 / (inv_sqrt_l ** 2)
+
+
+def _cle_colonne(name):
+    """Clé normalisée d'un nom de colonne (accents/casse/spaces ignorés)."""
+    s = unicodedata.normalize("NFD", str(name).strip().lower())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.replace(" ", "_").replace("-", "_")
+
+
+def _cle_materiau(name):
+    s = _cle_colonne(name).replace("_", " ").strip()
+    return s.replace("acier revetu", "acier revete")
+
+
+def _trouver_colonne(ligne, aliases):
+    """Première colonne (parmi les alias) portant une valeur renseignée sur la ligne."""
+    norm = {}
+    for c in ligne.index:
+        norm.setdefault(_cle_colonne(c), []).append(c)
+    for alias in aliases:
+        for c in norm.get(alias, []):
+            if _valeur_renseignee(ligne[c]):
+                return c
+    return None
+
+
+def _valeur_renseignee(valeur):
+    return valeur is not None and not pd.isna(valeur) and str(valeur).strip() != ""
+
+
+def _fmt_mm(valeur):
+    """Formatage français d'une rugosité en mm (virgule décimale)."""
+    return f"{valeur:g}".replace(".", ",")
+
+
+def _colonnes_rugosite(df):
+    """Colonnes d'entrée Materiaux/Rugosite (toutes variantes de nom)."""
+    clefs = {"materiaux", "materiau", "rugosite", "rugosite_mm", "k_mm"}
+    return [c for c in df.columns if _cle_colonne(c) in clefs]
+
+
+def normaliser_materiau(valeur):
+    """Nom canonique d'un matériau, ou None si la valeur est inconnue."""
+    cle = _cle_materiau(valeur)
+    for mat in RUGOSITES_MATERIAUX_MM:
+        if _cle_materiau(mat) == cle:
+            return mat
+    return {
+        "historique": MATERIAU_HISTORIQUE,
+        "personnalise": MATERIAU_PERSONNALISE,
+    }.get(cle)
+
+
+def _rugosite_depuis_ligne(ligne, params):
+    """Résout la rugosité d'une ligne d'import.
+
+    Priorité : colonne « Rugosite » > colonne « Materiaux » > réglage global
+    (GUI/CLI) > rugosité historique 0,1 mm.
+    Retourne (params_locaux, materiau, rugosite_mm, origine).
+    """
+    materiau = params.get("materiau_canalisation", MATERIAU_HISTORIQUE)
+    if materiau in RUGOSITES_MATERIAUX_MM:
+        k_mm = RUGOSITES_MATERIAUX_MM[materiau]
+    elif materiau == MATERIAU_HISTORIQUE:
+        k_mm = RUGOSITE_HISTORIQUE_MM
+    else:
+        k_mm = float(params["k_roughness"]) * 1000.0
+    origine = "réglage global"
+
+    col_mat = _trouver_colonne(ligne, ("materiaux", "materiau"))
+    if col_mat is not None and _valeur_renseignee(ligne[col_mat]):
+        mat = normaliser_materiau(ligne[col_mat])
+        if mat not in RUGOSITES_MATERIAUX_MM:
+            raise ValueError(
+                f"Matériau inconnu : {ligne[col_mat]!r}. "
+                f"Valeurs autorisées : {', '.join(RUGOSITES_MATERIAUX_MM)}"
+            )
+        materiau, k_mm, origine = mat, RUGOSITES_MATERIAUX_MM[mat], "colonne Materiaux"
+
+    col_rug = _trouver_colonne(ligne, ("rugosite", "rugosite_mm", "k_mm"))
+    if col_rug is not None and _valeur_renseignee(ligne[col_rug]):
+        try:
+            k_mm = float(str(ligne[col_rug]).strip().replace(",", "."))
+        except (TypeError, ValueError):
+            raise ValueError(f"Rugosité invalide : {ligne[col_rug]!r} (nombre attendu, en mm)")
+        if k_mm < 0:
+            raise ValueError("La rugosité k doit être positive ou nulle (en mm)")
+        origine = "colonne Rugosite"
+        if materiau not in RUGOSITES_MATERIAUX_MM:
+            materiau = MATERIAU_PERSONNALISE
+
+    p_local = dict(params)
+    p_local["k_roughness"] = k_mm / 1000.0
+    p_local["materiau_canalisation"] = materiau
+    p_local["rugosite_mm"] = k_mm
+    return p_local, materiau, k_mm, origine
 
 
 def debit_depuis_pente_colebrook(j_val: float, d_m: float, params: dict):
@@ -505,18 +616,19 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
     res_ph = []
     for _, r in df_ph.iterrows():
         d_m = float(r["dn_mm"]) / 1000.0
+        p_local, materiau_loc, k_mm_loc, origine_k = _rugosite_depuis_ligne(r, params)
         zh_prime = float(r["z_h"]) - dep_max
         xh = float(r["x_h"])
         if "ig1_force_pct" in r and pd.notna(r["ig1_force_pct"]) and float(r["ig1_force_pct"]) > 0:
             ig1 = float(r["ig1_force_pct"]) / 100.0
-            q1, _, _ = debit_depuis_pente_colebrook(ig1, d_m, params)
+            q1, _, _ = debit_depuis_pente_colebrook(ig1, d_m, p_local)
         else:
-            q1, ig1, _ = debit_avec_perte_singuliere(zh_prime - float(r["z_am"]), abs(xh - float(r["x_am"])), d_m, params)
+            q1, ig1, _ = debit_avec_perte_singuliere(zh_prime - float(r["z_am"]), abs(xh - float(r["x_am"])), d_m, p_local)
         if "ig2_force_pct" in r and pd.notna(r["ig2_force_pct"]) and float(r["ig2_force_pct"]) > 0:
             ig2 = float(r["ig2_force_pct"]) / 100.0
-            q2, _, _ = debit_depuis_pente_colebrook(ig2, d_m, params)
+            q2, _, _ = debit_depuis_pente_colebrook(ig2, d_m, p_local)
         else:
-            q2, ig2, _ = debit_avec_perte_singuliere(zh_prime - float(r["z_av"]), abs(float(r["x_av"]) - xh), d_m, params)
+            q2, ig2, _ = debit_avec_perte_singuliere(zh_prime - float(r["z_av"]), abs(float(r["x_av"]) - xh), d_m, p_local)
 
         q_rupt = max(q1, q2)
         q_rempl = v_rempl * math.pi * (d_m ** 2) / 4.0 * 3600.0
@@ -528,6 +640,8 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
             "ig1_pct": round(ig1 * 100, 3), "ig2_pct": round(ig2 * 100, 3),
             "q_rupture_m3h": round(q_rupt, 2), "q_rempl_m3h": round(q_rempl, 2),
             "q_dim_m3h": round(q_dim, 2), "equipement": equip, "capacite_m3h": cap,
+            "materiau_canalisation": materiau_loc, "rugosite_mm": round(k_mm_loc, 6),
+            "rugosite_origine": origine_k,
         }
         if mcp:
             ligne["regime_capacite_mcp"] = detail
@@ -540,14 +654,15 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
         xh, zh = float(r["x_h"]), float(r["z_h"])
         xb, zb = float(r["x_b"]), float(r["z_b"])
         d_m = float(r["dn_mm"]) / 1000.0
+        p_local, materiau_loc, k_mm_loc, origine_k = _rugosite_depuis_ligne(r, params)
         zh_prime = zh - dep_max
         z_piezo = zh_prime + (zb - zh_prime) * ((xi - xh) / (xb - xh)) if abs(xb - xh) > 1e-6 else zh_prime
         h_dep = zi - z_piezo
         if h_dep > h_seuil:
             zi_prime = zi - dep_max
             ig1_i = max((zh_prime - zi_prime) / abs(xi - xh), 0.0) if abs(xi - xh) > 0 else 0.0
-            q_a, _, _ = debit_depuis_pente_colebrook(ig1_i, d_m, params)
-            q_tot, ig2_i, _ = debit_avec_perte_singuliere(zi_prime - zb, abs(xb - xi), d_m, params)
+            q_a, _, _ = debit_depuis_pente_colebrook(ig1_i, d_m, p_local)
+            q_tot, ig2_i, _ = debit_avec_perte_singuliere(zi_prime - zb, abs(xb - xi), d_m, p_local)
             q_i = max(q_tot - q_a, 0.0)
             if q_i > 0:
                 equip_i, cap_i, detail_i = choisir_ventouse(q_i, source=source, regime="admission")
@@ -562,6 +677,8 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
             "depression_h_m": round(h_dep, 2), "protection_requise": besoin,
             "qa_m3h": round(q_a, 2), "q_total_m3h": round(q_tot, 2),
             "qi_air_m3h": round(q_i, 2), "equipement": equip_i, "capacite_m3h": cap_i,
+            "materiau_canalisation": materiau_loc, "rugosite_mm": round(k_mm_loc, 6),
+            "rugosite_origine": origine_k,
         }
         if mcp:
             ligne["regime_capacite_mcp"] = detail_i
@@ -617,11 +734,12 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
     for ih in idx_ph:
         xh, zh = float(df.loc[ih, "x_m"]), float(df.loc[ih, "z_m"])
         d_m = float(df.loc[ih, "dn_mm"]) / 1000.0
+        p_local, materiau_loc, k_mm_loc, origine_k = _rugosite_depuis_ligne(df.loc[ih], params)
         zh_prime = zh - dep_max
         ib_am = [ib for ib in idx_pb if ib < ih][-1] if [ib for ib in idx_pb if ib < ih] else None
         ib_av = [ib for ib in idx_pb if ib > ih][0] if [ib for ib in idx_pb if ib > ih] else None
-        q1, ig1, _ = debit_avec_perte_singuliere(zh_prime - float(df.loc[ib_am, "z_m"]), xh - float(df.loc[ib_am, "x_m"]), d_m, params) if ib_am is not None else (0.0, 0.0, 0.0)
-        q2, ig2, _ = debit_avec_perte_singuliere(zh_prime - float(df.loc[ib_av, "z_m"]), float(df.loc[ib_av, "x_m"]) - xh, d_m, params) if ib_av is not None else (0.0, 0.0, 0.0)
+        q1, ig1, _ = debit_avec_perte_singuliere(zh_prime - float(df.loc[ib_am, "z_m"]), xh - float(df.loc[ib_am, "x_m"]), d_m, p_local) if ib_am is not None else (0.0, 0.0, 0.0)
+        q2, ig2, _ = debit_avec_perte_singuliere(zh_prime - float(df.loc[ib_av, "z_m"]), float(df.loc[ib_av, "x_m"]) - xh, d_m, p_local) if ib_av is not None else (0.0, 0.0, 0.0)
         q_rupt = max(q1, q2)
         q_rempl = v_rempl * math.pi * (d_m ** 2) / 4.0 * 3600.0
         q_dim = max(q_rupt, q_rempl)
@@ -632,6 +750,8 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
             "ig1_pct": round(ig1 * 100, 3), "ig2_pct": round(ig2 * 100, 3),
             "q_rupture_m3h": round(q_rupt, 2), "q_rempl_m3h": round(q_rempl, 2),
             "q_dim_m3h": round(q_dim, 2), "equipement": equip, "capacite_m3h": cap,
+            "materiau_canalisation": materiau_loc, "rugosite_mm": round(k_mm_loc, 6),
+            "rugosite_origine": origine_k,
         }
         if mcp:
             ligne["regime_capacite_mcp"] = detail
@@ -651,14 +771,15 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
             for k in rng:
                 xk, zk = float(df.loc[k, "x_m"]), float(df.loc[k, "z_m"])
                 d_m = float(df.loc[k, "dn_mm"]) / 1000.0
+                p_local, materiau_loc, k_mm_loc, origine_k = _rugosite_depuis_ligne(df.loc[k], params)
                 z_line = zh_prime + (zb - zh_prime) * (abs(xk - xh) / abs(xb - xh))
                 piezo_min.loc[k] = min(piezo_min.loc[k], z_line)
                 h_dep = zk - z_line
                 if h_dep > h_seuil:
                     zk_prime = zk - dep_max
                     ig1_i = max((zh_prime - zk_prime) / abs(xk - xh), 0.0)
-                    q_a, _, _ = debit_depuis_pente_colebrook(ig1_i, d_m, params)
-                    q_tot, ig2_i, _ = debit_avec_perte_singuliere(zk_prime - zb, abs(xb - xk), d_m, params)
+                    q_a, _, _ = debit_depuis_pente_colebrook(ig1_i, d_m, p_local)
+                    q_tot, ig2_i, _ = debit_avec_perte_singuliere(zk_prime - zb, abs(xb - xk), d_m, p_local)
                     q_i = max(q_tot - q_a, 0.0)
                     if q_i > 0:
                         equip_i, cap_i, detail_i = choisir_ventouse(q_i, source=source, regime="admission")
@@ -671,6 +792,8 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
                         "x_i_m": round(xk, 2), "z_i_m": round(zk, 3), "depression_h_m": round(h_dep, 2),
                         "qa_m3h": round(q_a, 2), "q_total_m3h": round(q_tot, 2),
                         "qi_air_m3h": round(q_i, 2), "equipement": equip_i, "capacite_m3h": cap_i,
+                        "materiau_canalisation": materiau_loc, "rugosite_mm": round(k_mm_loc, 6),
+                        "rugosite_origine": origine_k,
                     }
                     if mcp:
                         ligne["regime_capacite_mcp"] = detail_i
@@ -701,6 +824,9 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
             "d_1_5h_mm": round(d_1_5h, 1), "d_2h_mm": round(6.7 * base, 1),
             "dn_vidange_retenu_mm": dn_ret, "pn_bar": int(df.loc[ib, "pn_bar"]),
         })
+    # Le profil détaillé reste au format historique : on retire les colonnes
+    # optionnelles d'import une fois tous les calculs terminés.
+    df = df.drop(columns=_colonnes_rugosite(df), errors="ignore")
     return df, pd.DataFrame(res_ph), pd.DataFrame(res_pi), pd.DataFrame(res_pb)
 
 
@@ -834,12 +960,26 @@ def exporter_excel_et_docx(sheets_dict: dict, figs: list, out_dir: Path, titre: 
         r.font.color.rgb = RGBColor(0x0F, 0x17, 0x2A)
 
     doc.add_heading("Paramètres de calcul retenus", level=2)
+    materiau_param = params.get("materiau_canalisation", MATERIAU_HISTORIQUE)
     doc.add_paragraph(
         f"Dépression max : {params['dep_max']} mCE | g = {params['g']} m/s² | "
-        f"nu = {params['nu']} m²/s | Rugosité k = {params['k_roughness']} m | "
+        f"nu = {params['nu']} m²/s | Matériau = {materiau_param} | "
+        f"Rugosité k = {_fmt_mm(float(params['k_roughness']) * 1000.0)} mm ({params['k_roughness']} m) | "
         f"Vitesse remplissage = {params['v_remplissage']} m/s | mu vidange = {params['mu_vidange']} | "
         f"Seuil point intermédiaire H = {params['h_seuil_interm']} m."
     )
+    origines = set()
+    for name in ("Points_Hauts", "Points_Intermediaires"):
+        df_tmp = sheets_dict.get(name)
+        if df_tmp is not None and not df_tmp.empty and "rugosite_origine" in df_tmp.columns:
+            origines.update(str(v) for v in df_tmp["rugosite_origine"].dropna().unique())
+    rugosites_fichier = sorted(o for o in origines if o.startswith("colonne"))
+    if rugosites_fichier:
+        doc.add_paragraph(
+            "Rugosités surchargeées depuis le fichier d'import (" + ", ".join(rugosites_fichier)
+            + ") : le détail par point figure dans les colonnes « materiau_canalisation », "
+            "« rugosite_mm » et « rugosite_origine » des tableaux."
+        )
 
     if params.get("source_ventouses") == "mcp":
         doc.add_paragraph(
@@ -929,7 +1069,7 @@ def _ouvrir_chemin_systeme(target: Path):
         subprocess.run(["xdg-open", path_str], check=False)
 
 
-VERSION_APP = "1.1.1"
+VERSION_APP = "1.2.0"
 
 GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des points hauts, intermédiaires et bas
 
@@ -970,6 +1110,13 @@ GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des poi
    vitesse de remplissage, coefficient de vidange, seuil des points intermédiaires
    et coefficient de perte singulière. Les valeurs par défaut sont documentées
    dans le README. Le séparateur décimal « , » est accepté.
+   Le sélecteur « Matériau canalisation » (PVC, Acier revêtu, Acier, Fonte, PRV,
+   PEHD ou Historique 0,1 mm) fixe automatiquement la rugosité k ; le champ k
+   reste modifiable pour une valeur particulière.
+   Les colonnes optionnelles « Materiaux » et « Rugosite » du fichier Excel
+   surchargent ce réglage point par point (Rugosite en mm, prioritaire sur
+   Materiaux). Le détail figure dans les colonnes « materiau_canalisation »,
+   « rugosite_mm » et « rugosite_origine » des résultats.
    La case « Dimensionner avec le catalogue MCP » (ou menu Catalogue) remplace
    les capacités historiques par les débits critiques du catalogue MCP pour
    choisir les ventouses : admission à -0,5 bar et évacuation à +0,9 bar.
@@ -1079,6 +1226,7 @@ if HAS_CTK:
             self.auto_open_var = ctk.BooleanVar(value=True)
             self.inclure_catalogue_var = ctk.BooleanVar(value=True)
             self.source_ventouses_var = ctk.BooleanVar(value=False)  # False = STD historique
+            self.materiau_var = ctk.StringVar(value=MATERIAU_HISTORIQUE)
             self.status_var = ctk.StringVar(value="Prêt")
 
             self._build_menu()
@@ -1188,6 +1336,18 @@ if HAS_CTK:
             self._journal(f"Source de dimensionnement : {source}\n")
             self._set_status(f"Dimensionnement : {source}")
 
+        def _materiau_change(self, _value=None):
+            """Applique la rugosité du matériau choisi au champ « k » (modifiable)."""
+            mat = self.materiau_var.get()
+            k_mm = RUGOSITES_MATERIAUX_MM.get(mat, RUGOSITE_HISTORIQUE_MM)
+            ent_k = self.param_entries.get("k_roughness")
+            if ent_k is not None:
+                ent_k.delete(0, "end")
+                ent_k.insert(0, str(k_mm / 1000.0))
+            self._invalider_cache_resultats()
+            self._journal(f"Matériau canalisation : {mat} — rugosité k = {_fmt_mm(k_mm)} mm\n")
+            self._set_status(f"Matériau : {mat} (k = {_fmt_mm(k_mm)} mm)")
+
         def _build_layout(self):
             self.grid_columnconfigure(0, weight=0, minsize=340)
             self.grid_columnconfigure(1, weight=1)
@@ -1263,6 +1423,15 @@ if HAS_CTK:
                 row=5, column=0, columnspan=2, sticky="w", padx=6, pady=(6, 4)
             )
 
+            ctk.CTkLabel(sidebar, text="Matériau canalisation :").grid(
+                row=6, column=0, sticky="w", padx=6, pady=3
+            )
+            self.combo_materiau = ctk.CTkComboBox(
+                sidebar, values=CHOIX_MATERIAUX, variable=self.materiau_var,
+                command=self._materiau_change, width=110
+            )
+            self.combo_materiau.grid(row=6, column=1, sticky="e", padx=6, pady=3)
+
             champs = [
                 ("dep_max", "Dépression max (mCE)", str(DEFAULT_PARAMS["dep_max"])),
                 ("k_roughness", "Rugosité k (m)", str(DEFAULT_PARAMS["k_roughness"])),
@@ -1273,14 +1442,14 @@ if HAS_CTK:
                 ("h_seuil_interm", "Seuil point interm. (m)", str(DEFAULT_PARAMS["h_seuil_interm"])),
                 ("k_sing", "Coeff. singulier k", str(DEFAULT_PARAMS["k_sing"])),
             ]
-            for idx, (key, label_txt, default_val) in enumerate(champs, start=6):
+            for idx, (key, label_txt, default_val) in enumerate(champs, start=7):
                 ctk.CTkLabel(sidebar, text=label_txt).grid(row=idx, column=0, sticky="w", padx=6, pady=3)
                 ent = ctk.CTkEntry(sidebar, width=110)
                 ent.insert(0, default_val)
                 ent.grid(row=idx, column=1, sticky="e", padx=6, pady=3)
                 self.param_entries[key] = ent
 
-            row = 14
+            row = 15
             ctk.CTkLabel(sidebar, text="Dossier de sortie :", font=ctk.CTkFont(weight="bold")).grid(
                 row=row, column=0, columnspan=2, sticky="w", padx=6, pady=(10, 2)
             )
@@ -1583,6 +1752,12 @@ if HAS_CTK:
             for k, ent in self.param_entries.items():
                 p[k] = float(ent.get().strip().replace(",", "."))
             p["source_ventouses"] = "mcp" if self.source_ventouses_var.get() else "std"
+            mat = self.materiau_var.get()
+            k_saisi_mm = p["k_roughness"] * 1000.0
+            k_attendu_mm = RUGOSITES_MATERIAUX_MM.get(mat, RUGOSITE_HISTORIQUE_MM)
+            p["materiau_canalisation"] = (
+                mat if abs(k_saisi_mm - k_attendu_mm) < 1e-9 else MATERIAU_PERSONNALISE
+            )
             return p
 
         def _afficher_figure(self, fig_name: str):
@@ -1703,6 +1878,11 @@ if HAS_CTK:
                 messagebox.showerror("Erreur de calcul", str(exc))
 
 
+def _float_arg(valeur):
+    """Convertisseur CLI acceptant le séparateur décimal ','."""
+    return float(str(valeur).strip().replace(",", "."))
+
+
 def main():
     parser = argparse.ArgumentParser(description="main1.py — Calcul équipements Points Hauts, Intermédiaires & Bas")
     parser.add_argument("--gui", action="store_true", help="Lancer l'interface graphique CustomTkinter")
@@ -1711,6 +1891,10 @@ def main():
     parser.add_argument("--out-dir", type=str, default="sorties_cli", help="Dossier de sortie")
     parser.add_argument("--source-ventouses", choices=["std", "mcp"], default="std",
                         help="Capacités utilisées pour le dimensionnement : std (historique) ou mcp (catalogue)")
+    parser.add_argument("--materiau", choices=CHOIX_MATERIAUX, default=MATERIAU_HISTORIQUE,
+                        help="Matériau de canalisation (rugosité Colebrook associée)")
+    parser.add_argument("--rugosite-mm", type=_float_arg, default=None,
+                        help="Rugosité absolue k en mm (écrase le matériau et le défaut 0,1 mm)")
     args = parser.parse_args()
 
     if args.mode is None or args.gui:
@@ -1726,6 +1910,16 @@ def main():
     out_dir = Path(args.out_dir)
     params = dict(DEFAULT_PARAMS)
     params["source_ventouses"] = args.source_ventouses
+    params["materiau_canalisation"] = args.materiau
+    params["k_roughness"] = (
+        RUGOSITES_MATERIAUX_MM[args.materiau] / 1000.0
+        if args.materiau in RUGOSITES_MATERIAUX_MM else RUGOSITE_HISTORIQUE_MM / 1000.0
+    )
+    if args.rugosite_mm is not None:
+        if args.rugosite_mm < 0:
+            raise ValueError("La rugosité k doit être positive ou nulle (en mm)")
+        params["k_roughness"] = args.rugosite_mm / 1000.0
+        params["materiau_canalisation"] = MATERIAU_PERSONNALISE
     if args.mode == "simple":
         df_ph = pd.read_excel(args.input_xlsx, sheet_name="Points_Hauts")
         df_pi = pd.read_excel(args.input_xlsx, sheet_name="Points_Intermediaires")
