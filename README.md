@@ -174,6 +174,14 @@ python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_MCP --sourc
 
 Colonnes attendues : `piquet`, `x_m`, `z_m`, `dn_mm`, `pn_bar`.
 
+La colonne `piquet` est un **libellé libre** : elle peut contenir des PK
+(`PK 0+000`, comme dans l'exemple fourni) ou directement des **numéros de piquet**
+(`1`, `2`, `3`, …). Son contenu n'est jamais parsé ni utilisé pour le calcul :
+c'est `x_m` qui donne l'abscisse en mètres. Remplacer les PK de l'exemple par des
+numéros ne bloque donc pas l'import et facilite la référence aux points dans le BCT.
+Les colonnes `piquet_h` / `piquet_i` / `piquet_pb` du mode `simple` se comportent
+de la même façon.
+
 Les points hauts et points bas sont déduits automatiquement de la cote `z_m`
 (par comparaison avec les piquets voisins).
 
@@ -204,7 +212,7 @@ contenu du classeur, pas une limite d'import.
 
 | Fichier | Mode | Contenu |
 |---|---|---|
-| `Exemple_Import_Profil_En_Long.xlsx` | `pl` | 17 piquets sur 4,6 km (PK 0+000 → PK 4+600), 4 points hauts, 3 points bas, 3 points intermédiaires équipés. Feuille `Profil_en_Long`. |
+| `Exemple_Import_Profil_En_Long.xlsx` | `pl` | 17 piquets sur 4,6 km (PK 0+000 → PK 4+600), 4 points hauts, 3 points bas, 3 points intermédiaires équipés. Feuille `Profil_en_Long`. Les PK de la colonne `piquet` sont de simples libellés, remplaçables par des numéros. |
 | `Exemple_Import_Cas_Simples.xlsx` | `simple` | 3 points hauts (dont un avec gradient forcé à 0,5 %), 3 points intermédiaires (1 cas NON, 2 cas OUI), 3 points bas. Feuilles `Points_Hauts`, `Points_Intermediaires`, `Points_Bas`. |
 
 Utilisation immédiate en ligne de commande :

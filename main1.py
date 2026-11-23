@@ -929,7 +929,7 @@ def _ouvrir_chemin_systeme(target: Path):
         subprocess.run(["xdg-open", path_str], check=False)
 
 
-VERSION_APP = "1.1.0"
+VERSION_APP = "1.1.1"
 
 GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des points hauts, intermédiaires et bas
 
@@ -952,6 +952,12 @@ GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des poi
      Le classeur d'exemple est chargé ET le mode de calcul correspondant est
      présélectionné automatiquement. Les exemples sont livrés à la racine du projet.
    • Raccourci : Ctrl+O.
+   La colonne « piquet » (ou « piquet_h » / « piquet_i » / « piquet_pb » en mode
+   Cas Simples) est un libellé libre : PK (« PK 0+000 », comme dans l'exemple
+   fourni) ou numéro de piquet (« 1 », « 2 », …). Elle n'est jamais parsée et ne
+   bloque pas l'import : l'abscisse est donnée par « x_m » (mode PL) ou « x_h » /
+   « x_i » / « x_pb » (mode Cas Simples). Vous pouvez donc remplacer les PK de
+   l'exemple par des numéros si votre BCT référence les points par leur numéro.
 
 4. DOSSIER DE SORTIE
    Le champ « Dossier de sortie » contient « sorties_app » par défaut (dossier relatif
