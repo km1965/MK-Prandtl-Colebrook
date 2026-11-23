@@ -1,0 +1,32 @@
+# Environnements Python
+env/
+venv/
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# PyInstaller
+build/
+*.spec
+# Recette conservée pour reconstruire l'exe
+!MK_Prandtl-Colebrook_V01.spec
+
+# Sorties générées
+sorties_app/
+sorties_cli/
+sorties_exemple_*/
+*.xlsx.bak
+
+# Éditeurs / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+# Binaire compilé (distribué via les GitHub Releases)
+dist/
+*.exe
