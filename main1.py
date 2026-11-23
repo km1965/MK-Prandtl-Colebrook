@@ -100,6 +100,8 @@ CATALOGUE_MCP_SOURCE = {
     "pression_nominale": "PN 10/16",
     "materiau_corps": "Fonte ductile GJS 500",
     "etancheite_min_bar": 0.1,
+    "domaine_validite": "Variété de fournisseurs / gammes valable pour DN conduite ≤ 900 mm "
+                        "(au-delà : montage en chandelier ou étude spécifique)",
     "debit_optimal_bar": 0.3,
     "debit_critique_evac_bar": 0.9,
     "debit_critique_adm_bar": -0.5,
@@ -230,6 +232,9 @@ DIMENSIONS_MCP = [
 ]
 
 REGLES_INGENIERIE_MCP = [
+    "Domaine de validité : la variété de fournisseurs / gammes de ce catalogue n'est valable "
+    "que pour des conduites DN ≤ 900 mm. Au-delà, prévoir un montage en chandelier "
+    "(DN 1200 / DN 1600) ou une étude spécifique.",
     "Réduction vanne papillon : l'installation d'une vanne d'isolement papillon en amont "
     "réduit le débit d'air d'environ 20 % (ex. : DN 100/150 passe de ~91 à ~73 Std m³/min à 0,3 bar).",
     "Montages en chandelier (DN conduite > 900 mm) : DN 1200 mm → 1 sortie DN 150 + 2 ventouses DN 100 "
@@ -286,13 +291,124 @@ def debit_avec_perte_singuliere(dz_eff: float, longueur_m: float, d_m: float, pa
     return (v_sol * math.pi * (d_m ** 2) / 4.0) * 3600.0, j_sol, v_sol
 
 
-def choisir_ventouse(q_requis_m3h: float):
+def choisir_ventouse(q_requis_m3h: float, source: str = "std", regime: str = "admission",
+                     q_evac_m3h: float = 0.0):
+    """Retourne (équipement, capacité m³/h, détail).
+
+    source = 'std'  : capacités historiques VENTOUSES_STD (comportement d'origine).
+    source = 'mcp'  : capacités du catalogue MCP (admission / évacuation critiques).
+    """
+    if source == "mcp":
+        return choisir_ventouse_mcp(q_requis_m3h, q_evac_m3h, regime)
+
+    q_eff = max(q_requis_m3h, q_evac_m3h)  # historique inchangé
     for dn, _, cap in VENTOUSES_STD:
-        if cap >= q_requis_m3h:
-            return f"1V{dn}", cap
+        if cap >= q_eff:
+            return f"1V{dn}", cap, "Capacités historiques VENTOUSES_STD"
     top_dn, _, top_cap = VENTOUSES_STD[-1]
-    nb = math.ceil(q_requis_m3h / top_cap)
-    return f"{nb}V{top_dn}", nb * top_cap
+    nb = math.ceil(q_eff / top_cap)
+    return f"{nb}V{top_dn}", nb * top_cap, "Capacités historiques VENTOUSES_STD"
+
+
+def _catalogue_mcp_selection():
+    """Une fiche par DN (on garde la plus grande capacité pour les DN dupliqués)."""
+    par_dn = {}
+    for fic in VENTOUSES_MCP:
+        dn = fic["dn_mm"]
+        if dn not in par_dn or fic["adm_crit_m3h"] > par_dn[dn]["adm_crit_m3h"]:
+            par_dn[dn] = fic
+    return sorted(par_dn.values(), key=lambda f: (f["adm_crit_m3h"], f["dn_mm"]))
+
+
+def choisir_ventouse_mcp(q_adm_m3h: float, q_evac_m3h: float = 0.0, regime: str = "admission"):
+    """Sélection MCP selon les débits critiques (Std m³/h).
+
+    regime : 'admission' (dépression), 'evacuation' (remplissage) ou 'both'.
+    Retourne (équipement, capacité m³/h, détail du régime).
+    """
+    if regime == "admission":
+        besoin_adm, besoin_evac = float(q_adm_m3h), float(q_evac_m3h)
+    elif regime == "evacuation":
+        besoin_adm, besoin_evac = 0.0, float(q_adm_m3h)
+    elif regime == "both":
+        besoin_adm = float(q_adm_m3h)
+        besoin_evac = float(q_evac_m3h) if q_evac_m3h else float(q_adm_m3h)
+    else:
+        raise ValueError(f"Régime inconnu : {regime!r}")
+
+    catalogue = _catalogue_mcp_selection()
+    for fic in catalogue:
+        if fic["adm_crit_m3h"] + 1e-9 >= besoin_adm and fic["evac_crit_m3h"] + 1e-9 >= besoin_evac:
+            capacite, nom_regime = (
+                (fic["adm_crit_m3h"], "admission critique (ΔP = -0,5 bar)")
+                if besoin_adm >= besoin_evac else
+                (fic["evac_crit_m3h"], "évacuation critique (ΔP = +0,9 bar)")
+            )
+            detail = (f"Catalogue MCP — {nom_regime} — {fic['dn']} — courbe {fic['courbe']}")
+            return f"1V{fic['dn_mm']} (MCP)", capacite, detail
+
+    top = catalogue[-1]
+    nb = max(math.ceil(besoin_adm / top["adm_crit_m3h"]),
+             math.ceil(besoin_evac / top["evac_crit_m3h"])) if (besoin_adm or besoin_evac) else 1
+    capacite = top["adm_crit_m3h"] if besoin_adm >= besoin_evac else top["evac_crit_m3h"]
+    detail = (f"Catalogue MCP — {nb} unités {top['dn']} — "
+              f"{'admission' if besoin_adm >= besoin_evac else 'évacuation'} critique")
+    return f"{nb}V{top['dn_mm']} (MCP)", nb * capacite, detail
+
+
+LIMITE_DN_MCP_MM = 900
+
+
+def domaine_validite_mcp(dn_mm):
+    """Domaine de validité de la gamme MCP pour un DN de conduite.
+
+    La variété de fournisseurs récapitulée dans le catalogue n'est valable que
+    pour DN ≤ 900 mm. Au-delà : montage en chandelier ou étude spécifique.
+    """
+    try:
+        dn = float(dn_mm)
+    except (TypeError, ValueError):
+        return "DN inconnu — à vérifier"
+    if dn <= LIMITE_DN_MCP_MM:
+        return "OK (DN ≤ 900 mm)"
+    return f"HORS DOMAINE (DN {int(dn)} > 900 mm) — chandelier / étude spécifique"
+
+
+def piquets_hors_domaine_mcp(res_ph, res_pi):
+    """Liste des piquets dont le DN dépasse le domaine de validité du catalogue."""
+    hors = []
+    for df, col_piquet in [(res_ph, "piquet_h"), (res_pi, "piquet_i")]:
+        if df is None or df.empty or "domaine_validite_mcp" not in df.columns:
+            continue
+        for _, r in df.iterrows():
+            if "HORS DOMAINE" in str(r["domaine_validite_mcp"]):
+                hors.append(str(r.get(col_piquet, "?")))
+    return hors
+
+
+def tableau_dimensionnement_mcp(res_ph, res_pi):
+    """Synthèse des choix MCP (besoin, capacité, marge) pour le rapport Excel."""
+    lignes = []
+    for df, categorie, col_q in [
+        (res_ph, "Point haut", "q_dim_m3h"),
+        (res_pi, "Point intermédiaire", "qi_air_m3h"),
+    ]:
+        if df is None or df.empty or "regime_capacite_mcp" not in df.columns:
+            continue
+        for _, r in df.iterrows():
+            besoin = float(r.get(col_q, 0.0) or 0.0)
+            capacite = float(r.get("capacite_m3h", 0.0) or 0.0)
+            lignes.append({
+                "categorie": categorie,
+                "piquet": r.get("piquet_h", r.get("piquet_i", "")),
+                "besoin_m3h": round(besoin, 2),
+                "equipement": r.get("equipement", ""),
+                "capacite_mcp_m3h": round(capacite, 2),
+                "marge_pct": round((capacite / besoin - 1.0) * 100.0, 1) if besoin > 0 else None,
+                "regime": r.get("regime_capacite_mcp", ""),
+                "domaine_validite": r.get("domaine_validite_mcp", ""),
+            })
+    return pd.DataFrame(lignes)
 
 
 # --- Fonctions d'interrogation du catalogue MCP -----------------------------
@@ -383,6 +499,8 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
     dep_max = params["dep_max"]
     v_rempl = params["v_remplissage"]
     h_seuil = params["h_seuil_interm"]
+    source = params.get("source_ventouses", "std")
+    mcp = source == "mcp"
 
     res_ph = []
     for _, r in df_ph.iterrows():
@@ -403,14 +521,18 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
         q_rupt = max(q1, q2)
         q_rempl = v_rempl * math.pi * (d_m ** 2) / 4.0 * 3600.0
         q_dim = max(q_rupt, q_rempl)
-        equip, cap = choisir_ventouse(q_dim)
-        res_ph.append({
+        equip, cap, detail = choisir_ventouse(q_rupt, source=source, regime="both", q_evac_m3h=q_rempl)
+        ligne = {
             "piquet_h": r["piquet_h"], "x_h_m": round(xh, 2), "z_h_m": round(float(r["z_h"]), 3),
             "dn_mm": int(r["dn_mm"]), "pn_bar": int(r.get("pn_bar", 16)),
             "ig1_pct": round(ig1 * 100, 3), "ig2_pct": round(ig2 * 100, 3),
             "q_rupture_m3h": round(q_rupt, 2), "q_rempl_m3h": round(q_rempl, 2),
             "q_dim_m3h": round(q_dim, 2), "equipement": equip, "capacite_m3h": cap,
-        })
+        }
+        if mcp:
+            ligne["regime_capacite_mcp"] = detail
+            ligne["domaine_validite_mcp"] = domaine_validite_mcp(r["dn_mm"])
+        res_ph.append(ligne)
 
     res_pi = []
     for _, r in df_pi.iterrows():
@@ -427,17 +549,24 @@ def calculer_mode_simple(df_ph: pd.DataFrame, df_pi: pd.DataFrame, df_pb: pd.Dat
             q_a, _, _ = debit_depuis_pente_colebrook(ig1_i, d_m, params)
             q_tot, ig2_i, _ = debit_avec_perte_singuliere(zi_prime - zb, abs(xb - xi), d_m, params)
             q_i = max(q_tot - q_a, 0.0)
-            equip_i, cap_i = choisir_ventouse(q_i) if q_i > 0 else ("Aucune", 0.0)
+            if q_i > 0:
+                equip_i, cap_i, detail_i = choisir_ventouse(q_i, source=source, regime="admission")
+            else:
+                equip_i, cap_i, detail_i = "Aucune", 0.0, ""
             besoin = "OUI (H > seuil)"
         else:
             ig1_i = ig2_i = q_a = q_tot = q_i = cap_i = 0.0
-            equip_i, besoin = "Aucune", "NON (H <= seuil)"
-        res_pi.append({
+            equip_i, besoin, detail_i = "Aucune", "NON (H <= seuil)", ""
+        ligne = {
             "piquet_i": r["piquet_i"], "x_i_m": round(xi, 2), "z_i_m": round(zi, 3),
             "depression_h_m": round(h_dep, 2), "protection_requise": besoin,
             "qa_m3h": round(q_a, 2), "q_total_m3h": round(q_tot, 2),
             "qi_air_m3h": round(q_i, 2), "equipement": equip_i, "capacite_m3h": cap_i,
-        })
+        }
+        if mcp:
+            ligne["regime_capacite_mcp"] = detail_i
+            ligne["domaine_validite_mcp"] = domaine_validite_mcp(r["dn_mm"])
+        res_pi.append(ligne)
 
     res_pb = []
     for idx, r in df_pb.iterrows():
@@ -461,6 +590,8 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
     df = df_pl.sort_values("x_m").reset_index(drop=True).copy()
     n = len(df)
     dep_max, v_rempl, h_seuil = params["dep_max"], params["v_remplissage"], params["h_seuil_interm"]
+    source = params.get("source_ventouses", "std")
+    mcp = source == "mcp"
 
     types = []
     for i in range(n):
@@ -494,14 +625,18 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
         q_rupt = max(q1, q2)
         q_rempl = v_rempl * math.pi * (d_m ** 2) / 4.0 * 3600.0
         q_dim = max(q_rupt, q_rempl)
-        equip, cap = choisir_ventouse(q_dim)
-        res_ph.append({
+        equip, cap, detail = choisir_ventouse(q_rupt, source=source, regime="both", q_evac_m3h=q_rempl)
+        ligne = {
             "piquet_h": df.loc[ih, "piquet"], "x_h_m": round(xh, 2), "z_h_m": round(zh, 3),
             "dn_mm": int(df.loc[ih, "dn_mm"]), "pn_bar": int(df.loc[ih, "pn_bar"]),
             "ig1_pct": round(ig1 * 100, 3), "ig2_pct": round(ig2 * 100, 3),
             "q_rupture_m3h": round(q_rupt, 2), "q_rempl_m3h": round(q_rempl, 2),
             "q_dim_m3h": round(q_dim, 2), "equipement": equip, "capacite_m3h": cap,
-        })
+        }
+        if mcp:
+            ligne["regime_capacite_mcp"] = detail
+            ligne["domaine_validite_mcp"] = domaine_validite_mcp(df.loc[ih, "dn_mm"])
+        res_ph.append(ligne)
         ph_infos.append({"ih": ih, "ib_am": ib_am, "ib_av": ib_av, "xh": xh, "zh_prime": zh_prime})
 
     res_pi = []
@@ -525,13 +660,22 @@ def calculer_profil_en_long(df_pl: pd.DataFrame, params: dict):
                     q_a, _, _ = debit_depuis_pente_colebrook(ig1_i, d_m, params)
                     q_tot, ig2_i, _ = debit_avec_perte_singuliere(zk_prime - zb, abs(xb - xk), d_m, params)
                     q_i = max(q_tot - q_a, 0.0)
-                    equip_i, cap_i = choisir_ventouse(q_i) if q_i > 0 else ("1V100", 3600.0)
-                    res_pi.append({
+                    if q_i > 0:
+                        equip_i, cap_i, detail_i = choisir_ventouse(q_i, source=source, regime="admission")
+                    elif mcp:
+                        equip_i, cap_i, detail_i = choisir_ventouse(0.0, source="mcp", regime="admission")
+                    else:
+                        equip_i, cap_i, detail_i = "1V100", 3600.0, "Capacités historiques VENTOUSES_STD"
+                    ligne = {
                         "piquet_i": df.loc[k, "piquet"], "versant": f"{df.loc[ih, 'piquet']} -> {df.loc[ib, 'piquet']}",
                         "x_i_m": round(xk, 2), "z_i_m": round(zk, 3), "depression_h_m": round(h_dep, 2),
                         "qa_m3h": round(q_a, 2), "q_total_m3h": round(q_tot, 2),
                         "qi_air_m3h": round(q_i, 2), "equipement": equip_i, "capacite_m3h": cap_i,
-                    })
+                    }
+                    if mcp:
+                        ligne["regime_capacite_mcp"] = detail_i
+                        ligne["domaine_validite_mcp"] = domaine_validite_mcp(df.loc[k, "dn_mm"])
+                    res_pi.append(ligne)
     df["z_piezo_min_m"] = piezo_min
 
     res_pb = []
@@ -697,6 +841,26 @@ def exporter_excel_et_docx(sheets_dict: dict, figs: list, out_dir: Path, titre: 
         f"Seuil point intermédiaire H = {params['h_seuil_interm']} m."
     )
 
+    if params.get("source_ventouses") == "mcp":
+        doc.add_paragraph(
+            "Dimensionnement des ventouses réalisé avec les capacités du catalogue MCP : "
+            "admission critique (ΔP = -0,5 bar) et évacuation critique (ΔP = +0,9 bar). "
+            "Le détail des choix figure dans la feuille « Dimensionnement_MCP »."
+        )
+        doc.add_paragraph(f"Domaine de validité : {CATALOGUE_MCP_SOURCE['domaine_validite']}.")
+        hors_domaine = piquets_hors_domaine_mcp(
+            sheets_dict.get("Points_Hauts"), sheets_dict.get("Points_Intermediaires")
+        )
+        if hors_domaine:
+            p = doc.add_paragraph(
+                "ATTENTION — dimensionnement MCP hors domaine de validité pour les piquets : "
+                + ", ".join(hors_domaine)
+                + ". Prévoir un montage en chandelier ou une étude spécifique."
+            )
+            for run in p.runs:
+                run.bold = True
+                run.font.color.rgb = RGBColor(0xB9, 0x1C, 0x1C)
+
     for name, df in sheets_dict.items():
         if df is None or df.empty or name == "Profil_Detail":
             continue
@@ -722,6 +886,7 @@ def exporter_excel_et_docx(sheets_dict: dict, figs: list, out_dir: Path, titre: 
             f"Débit critique : +{CATALOGUE_MCP_SOURCE['debit_critique_evac_bar']} bar (évac.) / "
             f"{CATALOGUE_MCP_SOURCE['debit_critique_adm_bar']} bar (adm.)."
         )
+        doc.add_paragraph(f"Domaine de validité : {CATALOGUE_MCP_SOURCE['domaine_validite']}.")
         cols_catalogue = ["dn", "serie_conduite", "evac_opt_m3h", "evac_crit_m3h",
                           "adm_opt_m3h", "adm_crit_m3h", "poids_kg"]
         tbl_cat = doc.add_table(rows=1, cols=len(cols_catalogue))
@@ -764,7 +929,7 @@ def _ouvrir_chemin_systeme(target: Path):
         subprocess.run(["xdg-open", path_str], check=False)
 
 
-VERSION_APP = "1.0.0"
+VERSION_APP = "1.1.0"
 
 GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des points hauts, intermédiaires et bas
 
@@ -799,6 +964,11 @@ GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des poi
    vitesse de remplissage, coefficient de vidange, seuil des points intermédiaires
    et coefficient de perte singulière. Les valeurs par défaut sont documentées
    dans le README. Le séparateur décimal « , » est accepté.
+   La case « Dimensionner avec le catalogue MCP » (ou menu Catalogue) remplace
+   les capacités historiques par les débits critiques du catalogue MCP pour
+   choisir les ventouses : admission à -0,5 bar et évacuation à +0,9 bar.
+   Cette gamme n'est valable que pour DN ≤ 900 mm ; un avertissement est affiché
+   (et consigné dans le rapport) si un piquet dépasse cette limite.
 
 6. LANCER LE CALCUL
    Cliquez sur « Lancer le calcul & générer rapports » (ou F5, ou menu Calcul).
@@ -824,6 +994,11 @@ GUIDE_UTILISATEUR = """GUIDE UTILISATEUR — Dimensionnement hydraulique des poi
    d'ouvrir les fichiers sources (.xlsx / .docx) et d'activer ou désactiver
    l'ajout du catalogue dans les rapports. Les données sont aussi accessibles
    depuis Python via les fonctions catalogue_mcp_par_dn(), capacite_mcp_m3h(), etc.
+   La case « Dimensionner avec le catalogue MCP » utilise ces capacités pour
+   le choix des ventouses et ajoute la feuille « Dimensionnement_MCP », avec une
+   colonne « domaine_validite » (DN ≤ 900 mm). Le menu « Importer un exemple »
+   identifie l'exemple PL par « exemple 17 piquets » : ce n'est pas une limite
+   d'import, toute la feuille Profil_en_Long est traitée.
 
 9. RACCOURCIS
    Ctrl+O        : sélectionner un fichier d'entrée
@@ -853,7 +1028,8 @@ Fonctionnalités principales :
   • Interface CustomTkinter avec barre de menus et barre d'outils
   • Exemples d'import intégrés (Fichier > Importer un exemple)
   • Choix du dossier de sortie et ouverture automatique du rapport Word
-  • Catalogue MCP des ventouses double orifice 3 fonctions (PN 10/16) intégré
+  • Catalogue MCP des ventouses double orifice 3 fonctions (PN 10/16) intégré,
+    consultable et utilisable pour le dimensionnement (option activable)
   • Export Excel multi-onglets et note de calcul Word
 
 Auteur : Mostafa Karim Soussi (@km1965)
@@ -896,6 +1072,7 @@ if HAS_CTK:
             self.mode_var = ctk.StringVar(value="pl")
             self.auto_open_var = ctk.BooleanVar(value=True)
             self.inclure_catalogue_var = ctk.BooleanVar(value=True)
+            self.source_ventouses_var = ctk.BooleanVar(value=False)  # False = STD historique
             self.status_var = ctk.StringVar(value="Prêt")
 
             self._build_menu()
@@ -928,7 +1105,7 @@ if HAS_CTK:
             menu_fichier.add_command(label="Sélectionner un fichier .xlsx...", accelerator="Ctrl+O",
                                      command=self._choisir_fichier)
             self.menu_exemples = Menu(menu_fichier, tearoff=0)
-            self.menu_exemples.add_command(label="Profil en Long (17 piquets)",
+            self.menu_exemples.add_command(label="Profil en Long (exemple 17 piquets)",
                                            command=lambda: self._importer_exemple("pl"))
             self.menu_exemples.add_command(label="Cas Simples (3 jeux de données)",
                                            command=lambda: self._importer_exemple("simple"))
@@ -974,6 +1151,10 @@ if HAS_CTK:
             menu_catalogue.add_separator()
             menu_catalogue.add_checkbutton(label="Inclure le catalogue dans les rapports",
                                            variable=self.inclure_catalogue_var)
+            menu_catalogue.add_checkbutton(
+                label="Dimensionner les ventouses avec le catalogue MCP",
+                variable=self.source_ventouses_var, command=self._source_change
+            )
             menubar.add_cascade(label="Catalogue", menu=menu_catalogue)
 
             menu_aide = Menu(menubar, tearoff=0)
@@ -994,6 +1175,12 @@ if HAS_CTK:
             mode = "Profil en Long" if self.mode_var.get() == "pl" else "Cas Simples"
             self._invalider_cache_resultats()
             self._set_status(f"Mode de calcul : {mode}")
+
+        def _source_change(self):
+            self._invalider_cache_resultats()
+            source = "catalogue MCP" if self.source_ventouses_var.get() else "capacités historiques STD"
+            self._journal(f"Source de dimensionnement : {source}\n")
+            self._set_status(f"Dimensionnement : {source}")
 
         def _build_layout(self):
             self.grid_columnconfigure(0, weight=0, minsize=340)
@@ -1111,6 +1298,12 @@ if HAS_CTK:
                             variable=self.inclure_catalogue_var).grid(
                 row=row, column=0, columnspan=2, sticky="w", padx=6, pady=2
             )
+            row += 1
+            ctk.CTkCheckBox(sidebar, text="Dimensionner avec le catalogue MCP",
+                            variable=self.source_ventouses_var,
+                            command=self._source_change).grid(
+                row=row, column=0, columnspan=2, sticky="w", padx=6, pady=2
+            )
 
             row += 1
             self.btn_run = ctk.CTkButton(
@@ -1223,6 +1416,7 @@ if HAS_CTK:
                 f"Débit optimal : ΔP = {CATALOGUE_MCP_SOURCE['debit_optimal_bar']} bar | "
                 f"Critique : +{CATALOGUE_MCP_SOURCE['debit_critique_evac_bar']} bar (évac.) / "
                 f"{CATALOGUE_MCP_SOURCE['debit_critique_adm_bar']} bar (adm.)",
+                f"Domaine de validité : {CATALOGUE_MCP_SOURCE['domaine_validite']}",
                 "",
                 "DÉBITS PAR DN (Std m³/h)",
                 "-" * 92,
@@ -1382,6 +1576,7 @@ if HAS_CTK:
             p = {}
             for k, ent in self.param_entries.items():
                 p[k] = float(ent.get().strip().replace(",", "."))
+            p["source_ventouses"] = "mcp" if self.source_ventouses_var.get() else "std"
             return p
 
         def _afficher_figure(self, fig_name: str):
@@ -1416,13 +1611,16 @@ if HAS_CTK:
                     df_pl = pd.read_excel(self.input_xlsx_path, sheet_name="Profil_en_Long")
                     df_out, res_ph, res_pi, res_pb = calculer_profil_en_long(df_pl, params)
                     figs = generer_figures_pl(df_out, res_ph, res_pi, res_pb, out_dir / "figures")
+                    sheets = {
+                        "Profil_Detail": df_out,
+                        "Points_Hauts": res_ph,
+                        "Points_Intermediaires": res_pi,
+                        "Points_Bas": res_pb,
+                    }
+                    if params.get("source_ventouses") == "mcp":
+                        sheets["Dimensionnement_MCP"] = tableau_dimensionnement_mcp(res_ph, res_pi)
                     xlsx_p, docx_p = exporter_excel_et_docx(
-                        {
-                            "Profil_Detail": df_out,
-                            "Points_Hauts": res_ph,
-                            "Points_Intermediaires": res_pi,
-                            "Points_Bas": res_pb,
-                        },
+                        sheets,
                         figs, out_dir, "Note de calcul — Profil en Long Complet", params,
                         inclure_catalogue=self.inclure_catalogue_var.get()
                     )
@@ -1440,8 +1638,15 @@ if HAS_CTK:
                     df_pb = pd.read_excel(self.input_xlsx_path, sheet_name="Points_Bas")
                     res_ph, res_pi, res_pb = calculer_mode_simple(df_ph, df_pi, df_pb, params)
                     figs = []
+                    sheets = {
+                        "Points_Hauts": res_ph,
+                        "Points_Intermediaires": res_pi,
+                        "Points_Bas": res_pb,
+                    }
+                    if params.get("source_ventouses") == "mcp":
+                        sheets["Dimensionnement_MCP"] = tableau_dimensionnement_mcp(res_ph, res_pi)
                     xlsx_p, docx_p = exporter_excel_et_docx(
-                        {"Points_Hauts": res_ph, "Points_Intermediaires": res_pi, "Points_Bas": res_pb},
+                        sheets,
                         figs, out_dir, "Note de calcul — Cas Simples", params,
                         inclure_catalogue=self.inclure_catalogue_var.get()
                     )
@@ -1452,27 +1657,26 @@ if HAS_CTK:
 
                 # Mise en cache pour les actions « Enregistrer » / « Enregistrer sous ».
                 self.last_params = params
-                if mode == "pl":
-                    self.last_resultats = {
-                        "Profil_Detail": df_out,
-                        "Points_Hauts": res_ph,
-                        "Points_Intermediaires": res_pi,
-                        "Points_Bas": res_pb,
-                    }
-                    self.last_titre = "Note de calcul — Profil en Long Complet"
-                else:
-                    self.last_resultats = {
-                        "Points_Hauts": res_ph,
-                        "Points_Intermediaires": res_pi,
-                        "Points_Bas": res_pb,
-                    }
-                    self.last_titre = "Note de calcul — Cas Simples"
+                self.last_resultats = dict(sheets)
+                self.last_titre = ("Note de calcul — Profil en Long Complet" if mode == "pl"
+                                   else "Note de calcul — Cas Simples")
 
                 self.last_out_dir = out_dir
                 self.last_xlsx_path = Path(xlsx_p)
                 self.last_docx_path = Path(docx_p)
                 self.btn_open_dir.configure(state="normal")
                 self.btn_open_docx.configure(state="normal")
+
+                if params.get("source_ventouses") == "mcp":
+                    hors_domaine = piquets_hors_domaine_mcp(res_ph, res_pi)
+                    if hors_domaine:
+                        msg = (
+                            "Le catalogue MCP n'est valable que pour des conduites DN ≤ 900 mm.\n"
+                            "Piquets hors domaine : " + ", ".join(hors_domaine) + ".\n"
+                            "Prévoir un montage en chandelier ou une étude spécifique."
+                        )
+                        self._journal("AVERTISSEMENT : " + msg.replace("\n", " ") + "\n")
+                        messagebox.showwarning("Catalogue MCP — domaine de validité", msg)
 
                 self.txt_resultats.insert("end", f"Fichiers générés :\n- Excel : {xlsx_p}\n- Word  : {docx_p}\n")
                 self.last_figs = figs
@@ -1499,6 +1703,8 @@ def main():
     parser.add_argument("--mode", choices=["simple", "pl"], help="Mode ligne de commande : 'simple' ou 'pl'")
     parser.add_argument("--input-xlsx", type=str, help="Chemin du fichier Excel (.xlsx) d'entrée")
     parser.add_argument("--out-dir", type=str, default="sorties_cli", help="Dossier de sortie")
+    parser.add_argument("--source-ventouses", choices=["std", "mcp"], default="std",
+                        help="Capacités utilisées pour le dimensionnement : std (historique) ou mcp (catalogue)")
     args = parser.parse_args()
 
     if args.mode is None or args.gui:
@@ -1512,30 +1718,42 @@ def main():
         raise ValueError("Veuillez préciser --input-xlsx en mode ligne de commande (--mode).")
 
     out_dir = Path(args.out_dir)
+    params = dict(DEFAULT_PARAMS)
+    params["source_ventouses"] = args.source_ventouses
     if args.mode == "simple":
         df_ph = pd.read_excel(args.input_xlsx, sheet_name="Points_Hauts")
         df_pi = pd.read_excel(args.input_xlsx, sheet_name="Points_Intermediaires")
         df_pb = pd.read_excel(args.input_xlsx, sheet_name="Points_Bas")
-        res_ph, res_pi, res_pb = calculer_mode_simple(df_ph, df_pi, df_pb, DEFAULT_PARAMS)
+        res_ph, res_pi, res_pb = calculer_mode_simple(df_ph, df_pi, df_pb, params)
+        sheets = {"Points_Hauts": res_ph, "Points_Intermediaires": res_pi, "Points_Bas": res_pb}
+        if params["source_ventouses"] == "mcp":
+            sheets["Dimensionnement_MCP"] = tableau_dimensionnement_mcp(res_ph, res_pi)
         xlsx_p, docx_p = exporter_excel_et_docx(
-            {"Points_Hauts": res_ph, "Points_Intermediaires": res_pi, "Points_Bas": res_pb},
-            [], out_dir, "Note de calcul — Cas Simples", DEFAULT_PARAMS
+            sheets, [], out_dir, "Note de calcul — Cas Simples", params
         )
     else:
         df_pl = pd.read_excel(args.input_xlsx, sheet_name="Profil_en_Long")
-        df_out, res_ph, res_pi, res_pb = calculer_profil_en_long(df_pl, DEFAULT_PARAMS)
+        df_out, res_ph, res_pi, res_pb = calculer_profil_en_long(df_pl, params)
         figs = generer_figures_pl(df_out, res_ph, res_pi, res_pb, out_dir / "figures")
+        sheets = {
+            "Profil_Detail": df_out,
+            "Points_Hauts": res_ph,
+            "Points_Intermediaires": res_pi,
+            "Points_Bas": res_pb,
+        }
+        if params["source_ventouses"] == "mcp":
+            sheets["Dimensionnement_MCP"] = tableau_dimensionnement_mcp(res_ph, res_pi)
         xlsx_p, docx_p = exporter_excel_et_docx(
-            {
-                "Profil_Detail": df_out,
-                "Points_Hauts": res_ph,
-                "Points_Intermediaires": res_pi,
-                "Points_Bas": res_pb,
-            },
-            figs, out_dir, "Note de calcul — Profil en Long Complet", DEFAULT_PARAMS
+            sheets, figs, out_dir, "Note de calcul — Profil en Long Complet", params
         )
 
     message = f"Calcul terminé avec succès -> Excel : {xlsx_p} | Word : {docx_p}"
+    if params["source_ventouses"] == "mcp":
+        hors_domaine = piquets_hors_domaine_mcp(res_ph, res_pi)
+        if hors_domaine:
+            message += ("\nATTENTION — catalogue MCP valable uniquement pour DN ≤ 900 mm ; "
+                        "piquets hors domaine : " + ", ".join(hors_domaine)
+                        + ". Prévoir un chandelier ou une étude spécifique.")
     # En mode --windowed (exe), sys.stdout est absent : ne pas faire échouer le calcul.
     try:
         if sys.stdout is not None:

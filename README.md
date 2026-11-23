@@ -47,7 +47,11 @@ et **Word**, et **catalogue MCP des ventouses intégré au code**.
 - **Rapports automatiques** : classeur Excel multi-onglets et note de calcul Word
   avec tableaux et graphiques.
 - **Catalogue MCP intégré** : débits, courbes, dimensions et règles d'ingénierie
-  des ventouses double orifice 3 fonctions PN 10/16, exportés dans les rapports.
+  des ventouses double orifice 3 fonctions PN 10/16, exportés dans les rapports
+  et **utilisables pour le dimensionnement** (option, voir ci-dessous).
+- **Deux sources de dimensionnement** : capacités historiques (`STD`, défaut,
+  résultats identiques aux versions précédentes) ou débits critiques du catalogue
+  MCP (`mcp`, admission à -0,5 bar et évacuation à +0,9 bar).
 
 ---
 
@@ -149,6 +153,9 @@ python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_PL
 
 # Cas simples
 python main1.py --mode simple --input-xlsx cas_simples.xlsx --out-dir sorties_simples
+
+# Avec le dimensionnement selon le catalogue MCP
+python main1.py --mode pl --input-xlsx profil.xlsx --out-dir sorties_MCP --source-ventouses mcp
 ```
 
 | Option | Description |
@@ -157,6 +164,7 @@ python main1.py --mode simple --input-xlsx cas_simples.xlsx --out-dir sorties_si
 | `--mode {pl,simple}` | Mode de calcul en ligne de commande |
 | `--input-xlsx` | Chemin du classeur d'entrée (obligatoire en CLI) |
 | `--out-dir` | Dossier de sortie (défaut : `sorties_cli`) |
+| `--source-ventouses {std,mcp}` | Capacités de dimensionnement : `std` historique (défaut) ou `mcp` (débits critiques du catalogue) |
 
 ---
 
@@ -168,6 +176,11 @@ Colonnes attendues : `piquet`, `x_m`, `z_m`, `dn_mm`, `pn_bar`.
 
 Les points hauts et points bas sont déduits automatiquement de la cote `z_m`
 (par comparaison avec les piquets voisins).
+
+**Aucune limite de nombre de piquets** : l'exemple livré en contient 17, mais
+l'application parcourt toute la feuille `Profil_en_Long` (le libellé « exemple 17
+piquets » du menu d'import décrit uniquement le classeur fourni, pas une contrainte
+du logiciel).
 
 ### Mode `simple` — trois onglets
 
@@ -186,7 +199,8 @@ Les colonnes `ig1_force_pct` / `ig2_force_pct` permettent de forcer un gradient
 
 Deux classeurs prêts à l'emploi sont fournis à la racine du projet. Ils sont
 auto-documentés (feuille `Notice` ignorée par l'application) et ont été testés
-avec les deux modes de calcul.
+avec les deux modes de calcul. Le libellé « exemple 17 piquets » désigne le
+contenu du classeur, pas une limite d'import.
 
 | Fichier | Mode | Contenu |
 |---|---|---|
@@ -228,8 +242,11 @@ ou l'autre et active automatiquement le mode de calcul correspondant.
 - **Débit sous pente imposée** : itération couplée `V ↔ λ` (`debit_depuis_pente_colebrook`).
 - **Débit avec perte singulière** : dichotomie sur
   `Δz = J_lin(V)·L + k_sing·V²/(2g)` (`debit_avec_perte_singuliere`).
-- **Point haut** : `Q_dim = max(Q_rupture, Q_remplissage)` ; la ventouse est
-  choisie dans `VENTOUSES_STD`, avec passage à plusieurs ventouses DN250 au-delà.
+- **Point haut** : `Q_dim = max(Q_rupture, Q_remplissage)` ; par défaut la ventouse
+  est choisie dans `VENTOUSES_STD` (passage à plusieurs DN250 au-delà). Avec
+  `--source-ventouses mcp`, la sélection utilise les capacités critiques MCP :
+  admission à −0,5 bar et évacuation à +0,9 bar, avec passage à plusieurs unités
+  du plus grand DN si une seule ne suffit pas.
 - **Point intermédiaire** : protection si la dépression `H` dépasse le seuil ;
   `Q_air = Q_total − Q_amont`.
 - **Point bas** : diamètre de vidange déduit du diamètre équivalent, de la
@@ -253,12 +270,18 @@ et `.docx`) a été **retranscrit dans `main1.py`**, section
 | `COURBES_MCP_ADMISSION` | 5 points de dépression (−0,1 → −0,5 bar) : courbes 50 / 80 / 100-150 mm |
 | `PURGE_PETIT_ORIFICE_MCP` | Débits de purge sous 5 → 25 bar pour 8 diamètres de tuyère (1,8 → 6,2 mm) |
 | `DIMENSIONS_MCP` | 12 lignes de dimensions L, H, M, D1, D2, brides PN10-16/PN25 et poids |
-| `REGLES_INGENIERIE_MCP` | Règles d'ingénierie (vanne papillon, chandeliers DN 1200/1600, équivalence corps/orifice, étanchéité 0,1 bar) |
+| `REGLES_INGENIERIE_MCP` | Règles d'ingénierie (domaine DN ≤ 900 mm, vanne papillon, chandeliers DN 1200/1600, équivalence corps/orifice, étanchéité 0,1 bar) |
 
-> **Note** : ces données sont une référence catalogue. Elles n'ont **pas** modifié
-> les capacités historiques de `VENTOUSES_STD` utilisées par le dimensionnement,
-> afin de préserver les résultats existants. Leur utilisation pour le choix des
-> ventouses pourra être activée explicitement dans une étape ultérieure.
+> **Note** : les capacités historiques de `VENTOUSES_STD` restent le défaut, afin
+> de préserver les résultats existants. Le dimensionnement peut désormais utiliser
+> explicitement les débits critiques MCP via l'option `--source-ventouses mcp`
+> (CLI) ou la case « Dimensionner avec le catalogue MCP » (interface).
+
+> **Domaine de validité** : la variété de fournisseurs / gammes récapitulée ici
+> n'est valable que pour des conduites **DN ≤ 900 mm**. Au-delà, le catalogue
+> renvoie aux montages en chandelier (DN 1200 / DN 1600) ou à une étude spécifique.
+> L'interface et les rapports signalent ce cas si un DN > 900 est rencontré en
+> mode de dimensionnement MCP.
 
 ### Fonctions d'interrogation
 
@@ -278,6 +301,9 @@ q_courbe = main1.debit_mcp_courbe(0.3, "evacuation", "courbe_100_150")  # 91.0
 catalogue = main1.catalogue_mcp_dataframe()
 dimensions = main1.dimensions_mcp_dataframe()
 courbes = main1.courbes_mcp_dataframe("admission")
+
+# Dimensionnement avec le catalogue (au lieu de VENTOUSES_STD)
+equipement, capacite, regime = main1.choisir_ventouse_mcp(4000, q_evac_m3h=2000)
 ```
 
 ### Dans l'interface
@@ -287,6 +313,11 @@ courbes = main1.courbes_mcp_dataframe("admission")
 - Menu **Catalogue > Ouvrir le classeur / la note** : accès direct aux fichiers sources.
 - Case **« Inclure le catalogue MCP dans les rapports »** : active ou non l'export
   des onglets catalogue (également dans le menu *Catalogue*).
+- Case **« Dimensionner avec le catalogue MCP »** (panneau latéral et menu
+  *Catalogue*) : remplace les capacités `STD` par les débits critiques MCP pour
+  choisir les ventouses ; ajoute la feuille `Dimensionnement_MCP` au rapport,
+  avec une colonne `domaine_validite`. Un avertissement (interface, CLI et note
+  Word) signale tout piquet dont le DN dépasse 900 mm.
 
 ### Présence dans les rapports
 
@@ -385,7 +416,9 @@ Copyright © 2026 Mostafa Karim Soussi (km1965).
 - [x] **Licence MIT** et dépôt GitHub public.
 - [x] **Exécutable Windows autonome** `MK_Prandtl-Colebrook_V01.exe` (PyInstaller)
       publié dans une GitHub Release.
-- [ ] Possibilité d'utiliser les capacités catalogue MCP pour le dimensionnement.
+- [x] **Utilisation des capacités catalogue MCP pour le dimensionnement** : option
+      « Dimensionner avec le catalogue MCP » dans l'interface et `--source-ventouses mcp`
+      en CLI, avec feuille de synthèse `Dimensionnement_MCP` dans le rapport Excel.
 
 ---
 
